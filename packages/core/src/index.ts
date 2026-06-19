@@ -4,3 +4,4 @@
  */
 export * from "./roles";
 export * from "./schemas/patient";
+export * from "./schemas/appointment";
