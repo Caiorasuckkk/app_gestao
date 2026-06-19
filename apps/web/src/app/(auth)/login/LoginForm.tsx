@@ -17,7 +17,13 @@
  * Tokens visuais: apenas classes Tailwind mapeadas em tailwind.config.ts
  * (primary, surface, danger, etc.). Sem hex solto.
  */
-import { useActionState, useEffect, useRef, useState } from "react";
+import {
+  useActionState,
+  useEffect,
+  useRef,
+  useState,
+  startTransition,
+} from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Eye, EyeOff, Activity } from "lucide-react";
@@ -57,8 +63,12 @@ export function LoginForm() {
     const form = event?.target as HTMLFormElement | undefined;
     if (form) {
       // Cria FormData e dispara a server action programaticamente.
+      // useActionState exige que a action seja chamada dentro de uma
+      // transition quando disparada por código (não pelo prop `action`).
       const formData = new FormData(form);
-      void formAction(formData);
+      startTransition(() => {
+        formAction(formData);
+      });
     }
   }
 
