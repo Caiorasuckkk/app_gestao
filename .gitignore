@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+.pnp.*
+.yarn/*
+
+# Build / output
+dist/
+build/
+.next/
+out/
+.expo/
+.turbo/
+*.tsbuildinfo
+
+# Env / secrets (NUNCA commitar)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Testes / cobertura
+coverage/
+playwright-report/
+test-results/
+
+# Supabase local
+supabase/.branches/
+supabase/.temp/
+
+# Obsidian (cache de workspace)
+.obsidian/workspace*.json
