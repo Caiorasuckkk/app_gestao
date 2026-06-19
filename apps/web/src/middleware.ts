@@ -1,28 +1,36 @@
 /**
  * Middleware de autenticação — Harmoni Care Web.
  *
- * Responsabilidades:
- * 1. Refresh de sessão: @supabase/ssr propaga tokens via cookies a cada request,
- *    garantindo que Server Components e Server Actions sempre vejam sessão válida.
- * 2. Proteção de rotas: caminhos sob /(dashboard) exigem sessão ativa.
- *    Usuário sem sessão é redirecionado para /login (preservando callbackUrl).
- * 3. Redirect de usuário autenticado: acesso a /login redireciona para o dashboard.
+ * Estratégia: ALLOWLIST de rotas públicas.
+ * Toda rota não-pública exige sessão. Se o usuário não estiver autenticado,
+ * redireciona para /login?next=<pathname>. Usuário autenticado em rota pública
+ * de auth vai para /dashboard.
+ *
+ * Rotas públicas:
+ * - /login, /register, /forgot-password (autenticação)
+ * - / (raiz — redireciona internamente para /dashboard, sem sessão irá para /login)
  *
  * Segurança:
- * - Nunca logar tokens ou dados de sessão.
- * - TODO: rate limiting em /login deve ser implementado na camada de borda
- *   (Vercel Edge Config + Upstash) antes do go-live. Ver SECURITY_GUIDELINES.md.
+ * - Nunca logar tokens, sessões ou dados pessoais.
+ * - Refresh de sessão via @supabase/ssr a cada request (getUser()).
+ * - TODO: rate limiting em /login antes do go-live (Upstash / Vercel Edge).
+ *   Ver SECURITY_GUIDELINES.md.
  *
  * @see https://supabase.com/docs/guides/auth/server-side/nextjs
  */
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
-/** Rotas que exigem autenticação (prefixos). */
-const PROTECTED_PREFIXES = ["/dashboard"];
+/**
+ * Rotas públicas que NÃO exigem sessão.
+ * Toda rota ausente desta lista requer autenticação.
+ */
+const PUBLIC_ROUTES = ["/login", "/register", "/forgot-password"];
 
-/** Rotas de autenticação (redirect se já autenticado). */
-const AUTH_ROUTES = ["/login"];
+/**
+ * Rotas de autenticação: usuário já autenticado é redirecionado para /dashboard.
+ */
+const AUTH_ONLY_ROUTES = ["/login", "/register", "/forgot-password"];
 
 export async function middleware(request: NextRequest) {
   let response = NextResponse.next({
@@ -55,21 +63,25 @@ export async function middleware(request: NextRequest) {
     },
   });
 
-  // IMPORTANTE: não chamar getUser() antes de refreshSession — o @supabase/ssr
-  // precisa que getUser() seja chamado para disparar o refresh de token silencioso.
+  // IMPORTANTE: getUser() dispara o refresh de token silencioso do @supabase/ssr.
+  // Deve ser chamado antes de qualquer decisão de roteamento.
   const {
     data: { user },
   } = await supabase.auth.getUser();
 
   const { pathname } = request.nextUrl;
 
-  const isProtected = PROTECTED_PREFIXES.some((prefix) =>
-    pathname.startsWith(prefix)
+  // A raiz "/" não é rota pública nem protegida diretamente —
+  // o page.tsx redireciona para /dashboard, que exigirá sessão.
+  const isPublicRoute = PUBLIC_ROUTES.some(
+    (route) => pathname === route || pathname.startsWith(route + "/")
   );
-  const isAuthRoute = AUTH_ROUTES.some((route) => pathname === route);
+  const isAuthRoute = AUTH_ONLY_ROUTES.some(
+    (route) => pathname === route || pathname.startsWith(route + "/")
+  );
 
-  // Sem sessão tentando acessar rota protegida → /login
-  if (isProtected && !user) {
+  // Usuário não autenticado em rota privada → /login?next=<pathname>
+  if (!user && !isPublicRoute && pathname !== "/") {
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = "/login";
     // Preserva a URL de destino para redirect pós-login.
@@ -77,8 +89,8 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(redirectUrl);
   }
 
-  // Autenticado tentando acessar /login → dashboard
-  if (isAuthRoute && user) {
+  // Usuário autenticado tentando acessar rota de auth → /dashboard
+  if (user && isAuthRoute) {
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = "/dashboard";
     redirectUrl.search = "";
@@ -89,8 +101,7 @@ export async function middleware(request: NextRequest) {
 }
 
 // Força Node.js runtime no middleware (não Edge) para compatibilidade com
-// @supabase/ssr, que usa APIs Node.js (process.version) internamente.
-// Ver: https://nextjs.org/docs/app/api-reference/file-conventions/middleware
+// @supabase/ssr, que usa APIs Node.js internamente.
 export const runtime = "nodejs";
 
 export const config = {
@@ -101,7 +112,8 @@ export const config = {
      * - _next/image (otimização de imagens)
      * - favicon.ico, robots.txt, sitemap.xml
      * - Arquivos com extensão (imagens, fontes, etc.)
+     * - /api/* (route handlers)
      */
-    "/((?!_next/static|_next/image|favicon.ico|robots.txt|sitemap.xml|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico|woff|woff2|ttf|otf)$).*)",
+    "/((?!_next/static|_next/image|favicon.ico|robots.txt|sitemap.xml|api/|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico|woff|woff2|ttf|otf)$).*)",
   ],
 };

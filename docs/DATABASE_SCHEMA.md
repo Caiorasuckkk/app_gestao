@@ -1,7 +1,7 @@
 # DATABASE_SCHEMA — Harmoni Care
 
 > Mantido pelo agente `backend-data`. Postgres via Supabase. Toda tabela de domínio tem `clinic_id` (tenant_id) + RLS.
-> Atualizado em: 2026-06-19 (migration 0001_init — revisão de segurança auditoria RLS).
+> Atualizado em: 2026-06-19 (migration 0003_clinic_id_defaults — defaults de clinic_id via auth_clinic_id(); data layer de pacientes).
 
 ---
 
@@ -77,7 +77,7 @@
 | Coluna | Tipo | Restrições |
 |---|---|---|
 | `id` | uuid | PK, default gen_random_uuid() |
-| `clinic_id` | uuid | not null, FK `clinics(id)` on delete restrict |
+| `clinic_id` | uuid | not null, FK `clinics(id)` on delete restrict, **default auth_clinic_id()** (migration 0003) |
 | `full_name` | text | not null, length 2–200, dado pessoal sensível |
 | `birth_date` | date | nullable |
 | `cpf` | text | nullable, regex `^\d{11}$`, dígito verificador (Zod), dado sensível |
@@ -86,6 +86,8 @@
 | `created_at` | timestamptz | not null, default now() |
 | `updated_at` | timestamptz | not null, default now(), trigger |
 | `deleted_at` | timestamptz | nullable — soft delete |
+
+> **Default de clinic_id (migration 0003):** o cliente NÃO precisa enviar `clinic_id` em INSERTs. O banco preenche automaticamente via `auth_clinic_id()` (lookup em `profiles` por `auth.uid()`). A policy `WITH CHECK` continua verificando o valor — é defesa em profundidade, não substituição. O código de aplicação nunca deve incluir `clinic_id` no payload de criação de pacientes.
 
 - Dado sensível LGPD art. 11. Nunca logar `cpf`, `email`, `phone`, `full_name`.
 - Soft delete via `deleted_at`; retenção mínima 20 anos (CFM). Purga física via processo DPO.
@@ -105,7 +107,7 @@
 | Coluna | Tipo | Restrições |
 |---|---|---|
 | `id` | uuid | PK, default gen_random_uuid() |
-| `clinic_id` | uuid | not null, FK `clinics(id)` on delete restrict |
+| `clinic_id` | uuid | not null, FK `clinics(id)` on delete restrict, **default auth_clinic_id()** (migration 0003) |
 | `patient_id` | uuid | not null, FK composta `(patient_id, clinic_id)` → `patients(id, clinic_id)` |
 | `professional_id` | uuid | not null, FK composta `(professional_id, clinic_id)` → `profiles(id, clinic_id)` |
 | `starts_at` | timestamptz | not null |
@@ -246,3 +248,62 @@ Purga definitiva de `patients` exige aprovação de DPO e execução via service
 - [ ] Política de retenção automatizada (job de purga com aprovação DPO).
 - [ ] Estratégia de backup e PITR (Supabase — habilitar no dashboard).
 - [ ] Index de texto completo em `patients.full_name` para busca (migration futura, avaliar `pg_trgm`).
+
+---
+
+## Data Layer — Módulo Pacientes
+
+Implementado em `apps/web/src/`:
+
+| Arquivo | Tipo | Funções exportadas |
+|---|---|---|
+| `lib/patients/queries.ts` | Módulo server-only (sem "use server") | `listPatients`, `getPatient` |
+| `app/(dashboard)/patients/actions.ts` | Server Actions ("use server") | `createPatient`, `updatePatient`, `softDeletePatient` |
+
+### Tipo Result
+
+Todas as funções retornam `Result<T>`:
+
+```ts
+type Result<T> = { ok: true; data: T } | { ok: false; error: string }
+```
+
+### Assinaturas
+
+```ts
+// queries.ts
+listPatients(options?: { search?: string; limit?: number; offset?: number })
+  : Promise<Result<{ items: Patient[]; total: number }>>
+
+getPatient(id: string)
+  : Promise<Result<Patient | null>>
+
+// actions.ts
+createPatient(input: unknown)     : Promise<Result<Patient>>
+updatePatient(id: string, input: unknown) : Promise<Result<Patient>>
+softDeletePatient(id: string)     : Promise<Result<{ id: string }>>
+```
+
+### Isolamento de tenant
+
+- O cliente Supabase é criado com `createServerClient` (anon key + cookie de sessão) — a RLS aplica como o usuário logado, sem service role.
+- Nenhuma função passa `clinic_id` explicitamente: a RLS resolve via `auth_clinic_id()` no banco.
+- `FORCE ROW LEVEL SECURITY` garante isolamento mesmo sob roles que normalmente bypassam RLS.
+- Mapeamento snake_case (banco) ↔ camelCase (app): feito internamente; o consumidor recebe `Patient` de `@harmoni/core`.
+
+### O que o agente de UI consome
+
+Importar de dois caminhos:
+
+```ts
+// Leituras (em Server Components):
+import { listPatients, getPatient } from "@/lib/patients/queries";
+
+// Mutations (em Server Actions ou formulários com action=):
+import { createPatient, updatePatient, softDeletePatient }
+  from "@/app/(dashboard)/patients/actions";
+
+// Tipos:
+import type { Patient } from "@harmoni/core";
+import type { Result, PatientListResult } from "@/lib/patients/queries";
+```

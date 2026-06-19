@@ -1,66 +1,67 @@
 /**
- * Rota: /dashboard (placeholder)
- * Server Component protegido — exige sessão ativa (middleware.ts garante).
+ * Rota: /dashboard
+ * Server Component — home do app shell.
  *
- * Lê o usuário no servidor via createServerClient (cookie-based session).
- * Se por algum motivo a sessão for inválida mesmo passando pelo middleware,
- * redireciona explicitamente para /login (defesa em profundidade).
+ * O logout e o e-mail do usuário agora vivem no layout compartilhado
+ * (dashboard)/layout.tsx. Esta página serve como boas-vindas e ponto de
+ * entrada para os módulos do sistema.
  *
- * TODO: substituir por layout.tsx de dashboard real com sidebar quando
- * os módulos (Agenda, Pacientes, etc.) estiverem implementados.
+ * Sem re-leitura de sessão aqui — o layout já verificou e redireciona
+ * para /login se necessário (defesa em profundidade no layout).
  */
-import { redirect } from "next/navigation";
-import { createServerClient } from "@/lib/supabase/server";
-import { logoutAction } from "@/app/(auth)/login/actions";
+import Link from "next/link";
+import { Users, Calendar } from "lucide-react";
 
-export default async function DashboardPage() {
-  const supabase = await createServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  // Defesa em profundidade: middleware já bloqueou, mas validamos aqui também.
-  if (!user) {
-    redirect("/login");
-  }
-
+export default function DashboardPage() {
   return (
-    <main className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-8">
-      <div className="w-full max-w-md bg-white rounded-xl shadow-sm border border-slate-100 p-8">
-        <div className="flex items-center gap-3 mb-6">
+    <div className="space-y-6">
+      {/* Cabeçalho */}
+      <div>
+        <h1 className="text-2xl font-bold text-primary">Dashboard</h1>
+        <p className="text-sm text-[#6B7280] mt-1">
+          Bem-vindo ao Harmoni Care. Selecione um módulo para começar.
+        </p>
+      </div>
+
+      {/* Atalhos de módulos */}
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <Link
+          href="/patients"
+          className="group flex items-center gap-4 p-5 bg-white rounded-lg border border-[rgba(31,78,95,0.1)] hover:border-primary/30 hover:shadow-sm transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+          aria-label="Ir para módulo de Pacientes"
+        >
           <div
-            className="w-10 h-10 rounded-full bg-primary flex items-center justify-center text-white font-semibold text-lg"
+            className="w-10 h-10 rounded-lg bg-[#DCEFF3] flex items-center justify-center group-hover:bg-primary/10 transition-colors"
             aria-hidden="true"
           >
-            {user.email?.[0]?.toUpperCase() ?? "?"}
+            <Users className="w-5 h-5 text-primary" aria-hidden="true" />
           </div>
           <div>
-            <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">
-              Sessão ativa
-            </p>
-            <p className="text-sm font-semibold text-primary truncate max-w-[240px]">
-              {user.email}
+            <p className="text-sm font-semibold text-primary">Pacientes</p>
+            <p className="text-xs text-[#6B7280] mt-0.5">
+              Cadastro e gestão
             </p>
           </div>
-        </div>
+        </Link>
 
-        <h1 className="text-2xl font-bold text-primary mb-2">
-          Olá, {user.email}
-        </h1>
-        <p className="text-slate-500 text-sm mb-8">
-          Dashboard em construção. Autenticação SSR funcionando corretamente.
-        </p>
-
-        {/* Logout via Server Action */}
-        <form action={logoutAction}>
-          <button
-            type="submit"
-            className="w-full h-10 rounded-lg border border-danger/40 text-danger text-sm font-medium hover:bg-red-50 active:bg-red-100 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger focus-visible:ring-offset-2"
+        {/* Placeholder — Agenda (a implementar) */}
+        <div
+          className="flex items-center gap-4 p-5 bg-white rounded-lg border border-[rgba(31,78,95,0.1)] opacity-50 cursor-not-allowed"
+          aria-label="Módulo de Agenda (em breve)"
+          role="article"
+        >
+          <div
+            className="w-10 h-10 rounded-lg bg-[#DCEFF3] flex items-center justify-center"
+            aria-hidden="true"
           >
-            Sair da conta
-          </button>
-        </form>
+            <Calendar className="w-5 h-5 text-primary" aria-hidden="true" />
+          </div>
+          <div>
+            <p className="text-sm font-semibold text-primary">Agenda</p>
+            <p className="text-xs text-[#6B7280] mt-0.5">Em breve</p>
+          </div>
+        </div>
       </div>
-    </main>
+    </div>
   );
 }
