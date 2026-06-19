@@ -28,11 +28,23 @@
 --   - Hard delete em appointments restrito a admin (B1).
 --   - TODO M1: controle de `notes` por papel — fase posterior.
 --   - TODO M3: record_access_log — fase posterior.
+--
+-- ORDEM DE APLICAÇÃO (corrigida para evitar 42P01 no SQL Editor):
+--   1. Extensions + enums
+--   2. Função genérica sem dependência de tabela (set_updated_at)
+--   3. Todas as tabelas com colunas, constraints, FKs, índices e unique indexes
+--      (sem policies ainda; unique indexes compostos de patients e profiles
+--       devem preceder a criação de appointments por causa das FKs compostas)
+--   4. Funções que dependem de tabelas: auth_clinic_id, is_clinic_admin,
+--      update_member_role, check_professional_role
+--   5. ENABLE + FORCE RLS, REVOKEs, GRANTs
+--   6. Policies (usam as funções do passo 4)
+--   7. Triggers (set_updated_at e check_professional_role) e comments
 -- =============================================================================
 
--- ---------------------------------------------------------------------------
--- Extensões necessárias
--- ---------------------------------------------------------------------------
+-- =============================================================================
+-- BLOCO 1: Extensions
+-- =============================================================================
 
 -- pgcrypto: gen_random_uuid() em Postgres < 13; no PG14+ é nativo mas
 -- habilitamos para compatibilidade e para funções de hash futuras.
@@ -41,9 +53,9 @@ create extension if not exists "pgcrypto";
 -- uuid-ossp: UUID v4 alternativo; mantemos por consistência com Supabase.
 create extension if not exists "uuid-ossp";
 
--- ---------------------------------------------------------------------------
--- Enums
--- ---------------------------------------------------------------------------
+-- =============================================================================
+-- BLOCO 2: Enums
+-- =============================================================================
 
 -- Papel do usuário dentro de uma clínica (tenant).
 -- Enum no Postgres garante integridade sem tabela lookup.
@@ -64,6 +76,10 @@ do $$ begin
     'realizado'   -- atendimento concluído
   );
 exception when duplicate_object then null; end $$;
+
+-- =============================================================================
+-- BLOCO 3: Função genérica sem dependência de tabela
+-- =============================================================================
 
 -- ---------------------------------------------------------------------------
 -- Função auxiliar: trigger de updated_at
@@ -88,159 +104,9 @@ begin
 end;
 $$;
 
--- ---------------------------------------------------------------------------
--- Função de segurança: auth_clinic_id()
--- ---------------------------------------------------------------------------
--- DESIGN DECISION (segurança crítica):
---
--- Problema: se derivarmos o tenant_id de um claim do JWT (ex.: jwt() ->> 'clinic_id'),
--- um cliente malicioso pode forjar/substituir esse claim, quebrando o isolamento
--- entre tenants. Isso é o vetor de ataque de "tenant hopping".
---
--- Solução: a função abaixo é SECURITY DEFINER (roda como o owner do schema,
--- não como o usuário chamador) e faz um SELECT na tabela `profiles` usando
--- auth.uid() — que é derivado pelo Supabase diretamente do JWT assinado com
--- o segredo do projeto, portanto não é forjável pelo cliente.
---
--- Toda política RLS usa auth_clinic_id() para derivar o tenant do contexto de
--- sessão atual, garantindo que mesmo que o payload JWT seja adulterado, o
--- isolamento permanece íntegro no banco.
---
--- Marcada como STABLE: pode ser avaliada uma vez por statement (não por row),
--- o que melhora performance sem comprometer segurança (auth.uid() é fixo
--- dentro de uma transação).
-
-create or replace function public.auth_clinic_id()
-returns uuid
-language sql
-stable
-security definer
-set search_path = ''
-as $$
-  select clinic_id
-  from public.profiles
-  where id = auth.uid()
-  limit 1;
-$$;
-
-comment on function public.auth_clinic_id() is
-  'Retorna o clinic_id (tenant) do usuário autenticado consultando profiles.'
-  ' SECURITY DEFINER: não pode ser influenciada por claims forjados no JWT.'
-  ' Use esta função em toda política RLS — nunca jwt() ->> ''clinic_id''.';
-
--- ---------------------------------------------------------------------------
--- Função de segurança: is_clinic_admin()    [C1]
--- ---------------------------------------------------------------------------
--- DESIGN DECISION (anti-escalonamento de privilégio):
---
--- Problema: a policy de UPDATE em profiles, sem restrição de coluna, permite
--- que qualquer usuário autenticado altere a própria coluna `role` de 'recepcao'
--- para 'admin' (ou altere `clinic_id` para cruzar tenants). PostgREST expõe
--- a tabela diretamente — restringir apenas na camada de serviço não é suficiente.
---
--- Solução: is_clinic_admin() é SECURITY DEFINER e consulta profiles via
--- auth.uid(), sem confiar em qualquer parâmetro do chamador. Usada em:
---   (a) WITH CHECK de UPDATE de role — somente admin pode mudar role de outros.
---   (b) Função RPC update_member_role() — canal único e auditável de mudança de papel.
---   (c) Policy de DELETE em appointments — hard delete só por admin.
---
--- STABLE: avaliada uma vez por statement; auth.uid() fixo na transação.
-
-create or replace function public.is_clinic_admin()
-returns boolean
-language sql
-stable
-security definer
-set search_path = ''
-as $$
-  select exists (
-    select 1
-    from public.profiles
-    where id = auth.uid()
-      and role = 'admin'
-  );
-$$;
-
-comment on function public.is_clinic_admin() is
-  'Retorna true se o usuário autenticado tem role=admin no seu tenant.'
-  ' SECURITY DEFINER + STABLE. Usada em policies de gestão de papéis e'
-  ' em restrições de DELETE privilegiado.';
-
--- ---------------------------------------------------------------------------
--- Função RPC privilegiada: update_member_role()    [C1]
--- ---------------------------------------------------------------------------
--- DESIGN DECISION (canal único para mudança de papel):
---
--- Em vez de depender exclusivamente de uma policy WITH CHECK complexa,
--- bloqueamos UPDATE de role diretamente no banco (a policy self-update
--- verifica que role e clinic_id não mudam) e expomos esta função SECURITY
--- DEFINER como o único canal autorizado para alterar papéis.
---
--- Vantagens:
---   1. Auditável: toda mudança de papel passa por aqui.
---   2. Anti-escalonamento: a checagem de admin é feita dentro da função,
---      com SECURITY DEFINER, não dependendo da RLS do chamador.
---   3. Sem risco de bypass via PostgREST UPDATE direto (a policy bloqueia).
---
--- Restrições:
---   - Somente o admin do mesmo tenant pode chamar com efeito.
---   - Não permite remover o próprio papel de admin (prevenção de lock-out).
---   - target_id deve pertencer ao mesmo tenant do caller.
-
-create or replace function public.update_member_role(
-  target_id  uuid,
-  new_role   public.user_role
-)
-returns void
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
-  v_caller_clinic_id uuid;
-  v_target_clinic_id uuid;
-begin
-  -- Obtém o clinic_id do chamador via profiles (não via JWT).
-  select clinic_id
-    into v_caller_clinic_id
-    from public.profiles
-   where id = auth.uid();
-
-  -- Obtém o clinic_id do alvo.
-  select clinic_id
-    into v_target_clinic_id
-    from public.profiles
-   where id = target_id;
-
-  -- Somente admin pode executar.
-  if not public.is_clinic_admin() then
-    raise exception 'Acesso negado: apenas administradores podem alterar papéis.'
-      using errcode = 'insufficient_privilege';
-  end if;
-
-  -- Admin não pode rebaixar a si mesmo (evita lock-out acidental).
-  if target_id = auth.uid() then
-    raise exception 'Administrador não pode alterar o próprio papel.'
-      using errcode = 'check_violation';
-  end if;
-
-  -- Garante que o alvo pertence ao mesmo tenant do chamador.
-  if v_target_clinic_id is null or v_target_clinic_id <> v_caller_clinic_id then
-    raise exception 'Usuário alvo não encontrado no mesmo tenant.'
-      using errcode = 'no_data_found';
-  end if;
-
-  update public.profiles
-     set role = new_role
-   where id = target_id
-     and clinic_id = v_caller_clinic_id;
-end;
-$$;
-
-comment on function public.update_member_role(uuid, public.user_role) is
-  'Canal único e auditável para mudança de papel de membro.'
-  ' Somente admin do mesmo tenant; não permite auto-rebaixamento.'
-  ' SECURITY DEFINER: checagem de privilégio não pode ser bypassada.';
+-- =============================================================================
+-- BLOCO 4: Tabelas (sem policies)
+-- =============================================================================
 
 -- ---------------------------------------------------------------------------
 -- Tabela: clinics (tenant raiz)
@@ -258,43 +124,6 @@ create table if not exists public.clinics (
 
 comment on table public.clinics is
   'Tenant raiz. Cada linha representa uma clínica/empresa cliente do SaaS.';
-
--- Trigger de updated_at
-create or replace trigger clinics_set_updated_at
-  before update on public.clinics
-  for each row execute function public.set_updated_at();
-
--- ---------------------------------------------------------------------------
--- RLS + Hardening: clinics    [C2]
--- ---------------------------------------------------------------------------
--- FORCE ROW LEVEL SECURITY: garante que mesmo o table owner (que por default
--- ignora RLS) seja barrado. Protege contra execuções acidentais via role
--- privilegiada que não seja service_role explícito do Supabase.
---
--- REVOKE ALL FROM anon: PostgREST/Supabase expõe as tabelas pela role `anon`
--- para usuários não autenticados. Dados de saúde não devem ser acessíveis
--- sem autenticação sob hipótese alguma.
---
--- GRANT mínimo para authenticated: clinics é somente leitura para o cliente
--- (INSERT/UPDATE/DELETE são feitos pela service role no onboarding/backend).
-
-alter table public.clinics enable row level security;
-alter table public.clinics force row level security;
-
-revoke all on public.clinics from anon;
-revoke all on public.clinics from authenticated;
--- Leitura apenas; escrita exclusiva pela service role (onboarding).
-grant select on public.clinics to authenticated;
-
--- SELECT: só vê a clínica à qual pertence.
-create policy "clinics_select_own"
-  on public.clinics
-  for select
-  to authenticated
-  using (id = public.auth_clinic_id());
-
--- INSERT/UPDATE/DELETE: apenas via service role (onboarding backend).
--- Nenhuma policy para usuário normal (default deny).
 
 -- ---------------------------------------------------------------------------
 -- Tabela: profiles
@@ -337,91 +166,9 @@ create index if not exists idx_profiles_clinic_id
 -- (professional_id, clinic_id) referenciando profiles(id, clinic_id).
 -- Garante, no nível do banco, que um agendamento só pode referenciar um
 -- profissional que pertença ao mesmo tenant do agendamento.
+-- DEVE preceder a criação da tabela appointments.
 create unique index if not exists uq_profiles_id_clinic
   on public.profiles(id, clinic_id);
-
--- ---------------------------------------------------------------------------
--- RLS + Hardening: profiles    [C2]
--- ---------------------------------------------------------------------------
-alter table public.profiles enable row level security;
-alter table public.profiles force row level security;
-
-revoke all on public.profiles from anon;
-revoke all on public.profiles from authenticated;
--- SELECT: ver colegas do tenant.
--- INSERT: onboarding (o próprio usuário cria o seu profile).
--- UPDATE: o usuário atualiza o próprio full_name; admin muda role via RPC.
--- DELETE bloqueado (desativação via service role).
-grant select, insert, update on public.profiles to authenticated;
-
--- SELECT: vê apenas perfis da mesma clínica.
-create policy "profiles_select_same_clinic"
-  on public.profiles
-  for select
-  to authenticated
-  using (clinic_id = public.auth_clinic_id());
-
--- INSERT: o próprio usuário cria seu perfil no onboarding (via trigger/edge fn).
--- clinic_id deve ser igual ao da função — impede criar perfil em outro tenant.
--- role recebe o default 'recepcao'; nunca aceitar role do payload do cliente
--- (a edge function de onboarding não envia role — usa o default do banco).
-create policy "profiles_insert_own"
-  on public.profiles
-  for insert
-  to authenticated
-  with check (
-    id = auth.uid()
-    and clinic_id = public.auth_clinic_id()
-  );
-
--- ---------------------------------------------------------------------------
--- UPDATE em profiles — anti-escalonamento de privilégio    [C1]
--- ---------------------------------------------------------------------------
--- DESIGN DECISION:
---
--- O usuário comum (recepcao/profissional) pode atualizar APENAS full_name.
--- As colunas `role` e `clinic_id` NÃO podem ser alteradas via UPDATE direto.
---
--- Implementação em duas políticas separadas:
---
--- (a) profiles_self_update: o próprio usuário pode atualizar somente full_name.
---     A cláusula WITH CHECK verifica que role e clinic_id permanecem iguais
---     aos valores atuais, bloqueando qualquer tentativa de auto-promoção.
---     Postgres avalia WITH CHECK CONTRA A NOVA LINHA — se role ou clinic_id
---     mudar em relação ao valor existente (OLD), a linha não passa.
---     Note: usamos uma subquery para obter os valores OLD (não disponíveis em
---     WITH CHECK de UPDATE em RLS), lendo o registro corrente da tabela.
---
--- (b) Mudança de role: BLOQUEADA via UPDATE direto. Canal único é a função
---     RPC update_member_role() (SECURITY DEFINER), que impede auto-promoção
---     e garante que só admin do mesmo tenant altere papéis.
---
--- Por que não uma policy "admin pode tudo"?
---   Uma policy permissiva para admin ainda permitiria que o admin alterasse
---   o próprio role para um papel diferente de admin (downgrade acidental ou
---   intencional por invasor que comprometeu a conta). A RPC bloqueia isso.
-
-create policy "profiles_self_update"
-  on public.profiles
-  for update
-  to authenticated
-  using (
-    -- Somente o próprio usuário pode acionar esta policy.
-    id = auth.uid()
-    and clinic_id = public.auth_clinic_id()
-  )
-  with check (
-    -- Garante que o usuário não mudou role nem clinic_id.
-    -- Lemos os valores "antes" da atualização diretamente da tabela (SECURITY
-    -- DEFINER de auth_clinic_id já isola o tenant; aqui comparamos com o
-    -- registro existente usando uma subquery correlacionada).
-    id = auth.uid()
-    and clinic_id = (select p.clinic_id from public.profiles p where p.id = auth.uid())
-    and role     = (select p.role      from public.profiles p where p.id = auth.uid())
-  );
-
--- DELETE: apenas via service role (desativação de conta).
--- Sem policy de delete para usuário normal.
 
 -- ---------------------------------------------------------------------------
 -- Tabela: patients
@@ -464,11 +211,6 @@ comment on column public.patients.deleted_at is
   'Soft delete. Retenção mínima: 20 anos (CFM). Exclusão definitiva via processo'
   ' controlado de purga com aprovação de DPO.';
 
--- Trigger de updated_at
-create or replace trigger patients_set_updated_at
-  before update on public.patients
-  for each row execute function public.set_updated_at();
-
 -- Índices em patients
 -- Justificativa: clinic_id filtra todos os selects de pacientes por tenant.
 create index if not exists idx_patients_clinic_id
@@ -493,50 +235,9 @@ create unique index if not exists idx_patients_clinic_cpf
 -- Necessário para que appointments use FK composta (patient_id, clinic_id)
 -- referenciando patients(id, clinic_id). Garante no banco que um agendamento
 -- só pode referenciar um paciente do mesmo tenant.
+-- DEVE preceder a criação da tabela appointments.
 create unique index if not exists uq_patients_id_clinic
   on public.patients(id, clinic_id);
-
--- ---------------------------------------------------------------------------
--- RLS + Hardening: patients    [C2]
--- ---------------------------------------------------------------------------
-alter table public.patients enable row level security;
-alter table public.patients force row level security;
-
-revoke all on public.patients from anon;
-revoke all on public.patients from authenticated;
--- Leitura, criação e atualização (soft delete via update de deleted_at).
--- Hard delete é bloqueado pela policy patients_no_hard_delete.
-grant select, insert, update on public.patients to authenticated;
-
--- SELECT: usuário vê apenas pacientes da sua clínica (inclui soft-deleted;
--- a aplicação filtra deleted_at is null, mas RLS garante isolamento de tenant).
-create policy "patients_select_same_clinic"
-  on public.patients
-  for select
-  to authenticated
-  using (clinic_id = public.auth_clinic_id());
-
--- INSERT: deve inserir no próprio tenant.
-create policy "patients_insert_same_clinic"
-  on public.patients
-  for insert
-  to authenticated
-  with check (clinic_id = public.auth_clinic_id());
-
--- UPDATE: só dentro do próprio tenant.
-create policy "patients_update_same_clinic"
-  on public.patients
-  for update
-  to authenticated
-  using (clinic_id = public.auth_clinic_id())
-  with check (clinic_id = public.auth_clinic_id());
-
--- DELETE (hard): não permitido por RLS — soft delete via UPDATE deleted_at.
--- Purga física controlada pelo service role (processo DPO).
-create policy "patients_no_hard_delete"
-  on public.patients
-  for delete
-  using (false);
 
 -- ---------------------------------------------------------------------------
 -- Tabela: appointments
@@ -544,6 +245,7 @@ create policy "patients_no_hard_delete"
 -- Agendamentos. Relaciona paciente e profissional dentro do tenant.
 -- FKs compostas garantem coerência de tenant (A1): patient_id e
 -- professional_id DEVEM pertencer ao mesmo clinic_id do agendamento.
+-- Depende de: uq_patients_id_clinic e uq_profiles_id_clinic (criados acima).
 
 create table if not exists public.appointments (
   id              uuid                    primary key default gen_random_uuid(),
@@ -602,8 +304,193 @@ comment on column public.appointments.notes is
   'Dado potencialmente clínico (LGPD). Não logar.'
   ' TODO M1: controle de visibilidade por papel (fase posterior).';
 
+-- Índices em appointments
+-- Justificativa: clinic_id filtra por tenant em toda query.
+create index if not exists idx_appointments_clinic_id
+  on public.appointments(clinic_id);
+
+-- FK patient_id: joins e listagem de agenda por paciente.
+create index if not exists idx_appointments_patient_id
+  on public.appointments(patient_id);
+
+-- FK professional_id: listagem de agenda por profissional.
+create index if not exists idx_appointments_professional_id
+  on public.appointments(professional_id);
+
+-- starts_at: queries de agenda por período (range de datas). Índice composto
+-- com clinic_id para cobrir o padrão de query mais comum:
+-- WHERE clinic_id = $1 AND starts_at BETWEEN $2 AND $3
+create index if not exists idx_appointments_clinic_starts_at
+  on public.appointments(clinic_id, starts_at);
+
+-- Status: filtro de listagem (ex.: agendamentos 'agendado' do dia).
+create index if not exists idx_appointments_clinic_status
+  on public.appointments(clinic_id, status);
+
+-- =============================================================================
+-- BLOCO 5: Funções que dependem de tabelas
+-- =============================================================================
+
 -- ---------------------------------------------------------------------------
--- Trigger A2: verificar role do professional_id    [A2]
+-- Função de segurança: auth_clinic_id()
+-- ---------------------------------------------------------------------------
+-- DESIGN DECISION (segurança crítica):
+--
+-- Problema: se derivarmos o tenant_id de um claim do JWT (ex.: jwt() ->> 'clinic_id'),
+-- um cliente malicioso pode forjar/substituir esse claim, quebrando o isolamento
+-- entre tenants. Isso é o vetor de ataque de "tenant hopping".
+--
+-- Solução: a função abaixo é SECURITY DEFINER (roda como o owner do schema,
+-- não como o usuário chamador) e faz um SELECT na tabela `profiles` usando
+-- auth.uid() — que é derivado pelo Supabase diretamente do JWT assinado com
+-- o segredo do projeto, portanto não é forjável pelo cliente.
+--
+-- Toda política RLS usa auth_clinic_id() para derivar o tenant do contexto de
+-- sessão atual, garantindo que mesmo que o payload JWT seja adulterado, o
+-- isolamento permanece íntegro no banco.
+--
+-- Marcada como STABLE: pode ser avaliada uma vez por statement (não por row),
+-- o que melhora performance sem comprometer segurança (auth.uid() é fixo
+-- dentro de uma transação).
+-- Depende de: public.profiles (criada no bloco 4).
+
+create or replace function public.auth_clinic_id()
+returns uuid
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select clinic_id
+  from public.profiles
+  where id = auth.uid()
+  limit 1;
+$$;
+
+comment on function public.auth_clinic_id() is
+  'Retorna o clinic_id (tenant) do usuário autenticado consultando profiles.'
+  ' SECURITY DEFINER: não pode ser influenciada por claims forjados no JWT.'
+  ' Use esta função em toda política RLS — nunca jwt() ->> ''clinic_id''.';
+
+-- ---------------------------------------------------------------------------
+-- Função de segurança: is_clinic_admin()    [C1]
+-- ---------------------------------------------------------------------------
+-- DESIGN DECISION (anti-escalonamento de privilégio):
+--
+-- Problema: a policy de UPDATE em profiles, sem restrição de coluna, permite
+-- que qualquer usuário autenticado altere a própria coluna `role` de 'recepcao'
+-- para 'admin' (ou altere `clinic_id` para cruzar tenants). PostgREST expõe
+-- a tabela diretamente — restringir apenas na camada de serviço não é suficiente.
+--
+-- Solução: is_clinic_admin() é SECURITY DEFINER e consulta profiles via
+-- auth.uid(), sem confiar em qualquer parâmetro do chamador. Usada em:
+--   (a) WITH CHECK de UPDATE de role — somente admin pode mudar role de outros.
+--   (b) Função RPC update_member_role() — canal único e auditável de mudança de papel.
+--   (c) Policy de DELETE em appointments — hard delete só por admin.
+--
+-- STABLE: avaliada uma vez por statement; auth.uid() fixo na transação.
+-- Depende de: public.profiles (criada no bloco 4).
+
+create or replace function public.is_clinic_admin()
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+    from public.profiles
+    where id = auth.uid()
+      and role = 'admin'
+  );
+$$;
+
+comment on function public.is_clinic_admin() is
+  'Retorna true se o usuário autenticado tem role=admin no seu tenant.'
+  ' SECURITY DEFINER + STABLE. Usada em policies de gestão de papéis e'
+  ' em restrições de DELETE privilegiado.';
+
+-- ---------------------------------------------------------------------------
+-- Função RPC privilegiada: update_member_role()    [C1]
+-- ---------------------------------------------------------------------------
+-- DESIGN DECISION (canal único para mudança de papel):
+--
+-- Em vez de depender exclusivamente de uma policy WITH CHECK complexa,
+-- bloqueamos UPDATE de role diretamente no banco (a policy self-update
+-- verifica que role e clinic_id não mudam) e expomos esta função SECURITY
+-- DEFINER como o único canal autorizado para alterar papéis.
+--
+-- Vantagens:
+--   1. Auditável: toda mudança de papel passa por aqui.
+--   2. Anti-escalonamento: a checagem de admin é feita dentro da função,
+--      com SECURITY DEFINER, não dependendo da RLS do chamador.
+--   3. Sem risco de bypass via PostgREST UPDATE direto (a policy bloqueia).
+--
+-- Restrições:
+--   - Somente o admin do mesmo tenant pode chamar com efeito.
+--   - Não permite remover o próprio papel de admin (prevenção de lock-out).
+--   - target_id deve pertencer ao mesmo tenant do caller.
+-- Depende de: public.profiles (criada no bloco 4) e public.is_clinic_admin()
+--   (criada acima neste bloco).
+
+create or replace function public.update_member_role(
+  target_id  uuid,
+  new_role   public.user_role
+)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_caller_clinic_id uuid;
+  v_target_clinic_id uuid;
+begin
+  -- Obtém o clinic_id do chamador via profiles (não via JWT).
+  select clinic_id
+    into v_caller_clinic_id
+    from public.profiles
+   where id = auth.uid();
+
+  -- Obtém o clinic_id do alvo.
+  select clinic_id
+    into v_target_clinic_id
+    from public.profiles
+   where id = target_id;
+
+  -- Somente admin pode executar.
+  if not public.is_clinic_admin() then
+    raise exception 'Acesso negado: apenas administradores podem alterar papéis.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  -- Admin não pode rebaixar a si mesmo (evita lock-out acidental).
+  if target_id = auth.uid() then
+    raise exception 'Administrador não pode alterar o próprio papel.'
+      using errcode = 'check_violation';
+  end if;
+
+  -- Garante que o alvo pertence ao mesmo tenant do chamador.
+  if v_target_clinic_id is null or v_target_clinic_id <> v_caller_clinic_id then
+    raise exception 'Usuário alvo não encontrado no mesmo tenant.'
+      using errcode = 'no_data_found';
+  end if;
+
+  update public.profiles
+     set role = new_role
+   where id = target_id
+     and clinic_id = v_caller_clinic_id;
+end;
+$$;
+
+comment on function public.update_member_role(uuid, public.user_role) is
+  'Canal único e auditável para mudança de papel de membro.'
+  ' Somente admin do mesmo tenant; não permite auto-rebaixamento.'
+  ' SECURITY DEFINER: checagem de privilégio não pode ser bypassada.';
+
+-- ---------------------------------------------------------------------------
+-- Função trigger: check_professional_role()    [A2]
 -- ---------------------------------------------------------------------------
 -- DESIGN DECISION:
 -- A coluna professional_id deveria referenciar apenas usuários com role
@@ -620,6 +507,8 @@ comment on column public.appointments.notes is
 -- trigger ocorre sob a role do usuário que disparou o DML; como profiles tem
 -- RLS com select aberto ao mesmo tenant, a consulta é válida para usuários
 -- autenticados. A service role (sem RLS) também consegue executar o trigger.
+-- Depende de: public.profiles (criada no bloco 4).
+-- O trigger que chama esta função é criado no bloco 7.
 
 create or replace function public.check_professional_role()
 returns trigger
@@ -659,32 +548,57 @@ comment on function public.check_professional_role() is
   ' Garante que professional_id tenha role profissional ou admin (A2).'
   ' Regra de negócio: recepcao não pode ser profissional de um agendamento.';
 
-create or replace trigger appointments_check_professional
-  before insert or update of professional_id on public.appointments
-  for each row execute function public.check_professional_role();
+-- =============================================================================
+-- BLOCO 6: ENABLE + FORCE RLS, REVOKEs, GRANTs
+-- =============================================================================
 
--- Índices em appointments
--- Justificativa: clinic_id filtra por tenant em toda query.
-create index if not exists idx_appointments_clinic_id
-  on public.appointments(clinic_id);
+-- ---------------------------------------------------------------------------
+-- RLS + Hardening: clinics    [C2]
+-- ---------------------------------------------------------------------------
+-- FORCE ROW LEVEL SECURITY: garante que mesmo o table owner (que por default
+-- ignora RLS) seja barrado. Protege contra execuções acidentais via role
+-- privilegiada que não seja service_role explícito do Supabase.
+--
+-- REVOKE ALL FROM anon: PostgREST/Supabase expõe as tabelas pela role `anon`
+-- para usuários não autenticados. Dados de saúde não devem ser acessíveis
+-- sem autenticação sob hipótese alguma.
+--
+-- GRANT mínimo para authenticated: clinics é somente leitura para o cliente
+-- (INSERT/UPDATE/DELETE são feitos pela service role no onboarding/backend).
 
--- FK patient_id: joins e listagem de agenda por paciente.
-create index if not exists idx_appointments_patient_id
-  on public.appointments(patient_id);
+alter table public.clinics enable row level security;
+alter table public.clinics force row level security;
 
--- FK professional_id: listagem de agenda por profissional.
-create index if not exists idx_appointments_professional_id
-  on public.appointments(professional_id);
+revoke all on public.clinics from anon;
+revoke all on public.clinics from authenticated;
+-- Leitura apenas; escrita exclusiva pela service role (onboarding).
+grant select on public.clinics to authenticated;
 
--- starts_at: queries de agenda por período (range de datas). Índice composto
--- com clinic_id para cobrir o padrão de query mais comum:
--- WHERE clinic_id = $1 AND starts_at BETWEEN $2 AND $3
-create index if not exists idx_appointments_clinic_starts_at
-  on public.appointments(clinic_id, starts_at);
+-- ---------------------------------------------------------------------------
+-- RLS + Hardening: profiles    [C2]
+-- ---------------------------------------------------------------------------
+alter table public.profiles enable row level security;
+alter table public.profiles force row level security;
 
--- Status: filtro de listagem (ex.: agendamentos 'agendado' do dia).
-create index if not exists idx_appointments_clinic_status
-  on public.appointments(clinic_id, status);
+revoke all on public.profiles from anon;
+revoke all on public.profiles from authenticated;
+-- SELECT: ver colegas do tenant.
+-- INSERT: onboarding (o próprio usuário cria o seu profile).
+-- UPDATE: o usuário atualiza o próprio full_name; admin muda role via RPC.
+-- DELETE bloqueado (desativação via service role).
+grant select, insert, update on public.profiles to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- RLS + Hardening: patients    [C2]
+-- ---------------------------------------------------------------------------
+alter table public.patients enable row level security;
+alter table public.patients force row level security;
+
+revoke all on public.patients from anon;
+revoke all on public.patients from authenticated;
+-- Leitura, criação e atualização (soft delete via update de deleted_at).
+-- Hard delete é bloqueado pela policy patients_no_hard_delete.
+grant select, insert, update on public.patients to authenticated;
 
 -- ---------------------------------------------------------------------------
 -- RLS + Hardening: appointments    [C2]
@@ -699,7 +613,147 @@ revoke all on public.appointments from authenticated;
 -- Concedemos DELETE no nível de grant mas a policy bloqueia para não-admin.
 grant select, insert, update, delete on public.appointments to authenticated;
 
+-- =============================================================================
+-- BLOCO 7: Policies
+-- =============================================================================
+-- Todas as funções chamadas aqui (auth_clinic_id, is_clinic_admin) foram
+-- criadas no bloco 5 e já referenciam public.profiles existente.
+
+-- ---------------------------------------------------------------------------
+-- Policies: clinics
+-- ---------------------------------------------------------------------------
+
+-- SELECT: só vê a clínica à qual pertence.
+-- Depende de: auth_clinic_id() (bloco 5) → profiles (bloco 4). OK.
+create policy "clinics_select_own"
+  on public.clinics
+  for select
+  to authenticated
+  using (id = public.auth_clinic_id());
+
+-- INSERT/UPDATE/DELETE: apenas via service role (onboarding backend).
+-- Nenhuma policy para usuário normal (default deny).
+
+-- ---------------------------------------------------------------------------
+-- Policies: profiles
+-- ---------------------------------------------------------------------------
+
+-- SELECT: vê apenas perfis da mesma clínica.
+-- Depende de: auth_clinic_id() (bloco 5) → profiles (bloco 4). OK.
+create policy "profiles_select_same_clinic"
+  on public.profiles
+  for select
+  to authenticated
+  using (clinic_id = public.auth_clinic_id());
+
+-- INSERT: o próprio usuário cria seu perfil no onboarding (via trigger/edge fn).
+-- clinic_id deve ser igual ao da função — impede criar perfil em outro tenant.
+-- role recebe o default 'recepcao'; nunca aceitar role do payload do cliente
+-- (a edge function de onboarding não envia role — usa o default do banco).
+-- Depende de: auth_clinic_id() (bloco 5) → profiles (bloco 4). OK.
+create policy "profiles_insert_own"
+  on public.profiles
+  for insert
+  to authenticated
+  with check (
+    id = auth.uid()
+    and clinic_id = public.auth_clinic_id()
+  );
+
+-- ---------------------------------------------------------------------------
+-- UPDATE em profiles — anti-escalonamento de privilégio    [C1]
+-- ---------------------------------------------------------------------------
+-- DESIGN DECISION:
+--
+-- O usuário comum (recepcao/profissional) pode atualizar APENAS full_name.
+-- As colunas `role` e `clinic_id` NÃO podem ser alteradas via UPDATE direto.
+--
+-- Implementação em duas políticas separadas:
+--
+-- (a) profiles_self_update: o próprio usuário pode atualizar somente full_name.
+--     A cláusula WITH CHECK verifica que role e clinic_id permanecem iguais
+--     aos valores atuais, bloqueando qualquer tentativa de auto-promoção.
+--     Postgres avalia WITH CHECK CONTRA A NOVA LINHA — se role ou clinic_id
+--     mudar em relação ao valor existente (OLD), a linha não passa.
+--     Note: usamos uma subquery para obter os valores OLD (não disponíveis em
+--     WITH CHECK de UPDATE em RLS), lendo o registro corrente da tabela.
+--
+-- (b) Mudança de role: BLOQUEADA via UPDATE direto. Canal único é a função
+--     RPC update_member_role() (SECURITY DEFINER), que impede auto-promoção
+--     e garante que só admin do mesmo tenant altere papéis.
+--
+-- Por que não uma policy "admin pode tudo"?
+--   Uma policy permissiva para admin ainda permitiria que o admin alterasse
+--   o próprio role para um papel diferente de admin (downgrade acidental ou
+--   intencional por invasor que comprometeu a conta). A RPC bloqueia isso.
+--
+-- Depende de: auth_clinic_id() (bloco 5) → profiles (bloco 4). OK.
+
+create policy "profiles_self_update"
+  on public.profiles
+  for update
+  to authenticated
+  using (
+    -- Somente o próprio usuário pode acionar esta policy.
+    id = auth.uid()
+    and clinic_id = public.auth_clinic_id()
+  )
+  with check (
+    -- Garante que o usuário não mudou role nem clinic_id.
+    -- Lemos os valores "antes" da atualização diretamente da tabela (SECURITY
+    -- DEFINER de auth_clinic_id já isola o tenant; aqui comparamos com o
+    -- registro existente usando uma subquery correlacionada).
+    id = auth.uid()
+    and clinic_id = (select p.clinic_id from public.profiles p where p.id = auth.uid())
+    and role     = (select p.role      from public.profiles p where p.id = auth.uid())
+  );
+
+-- DELETE: apenas via service role (desativação de conta).
+-- Sem policy de delete para usuário normal.
+
+-- ---------------------------------------------------------------------------
+-- Policies: patients
+-- ---------------------------------------------------------------------------
+
+-- SELECT: usuário vê apenas pacientes da sua clínica (inclui soft-deleted;
+-- a aplicação filtra deleted_at is null, mas RLS garante isolamento de tenant).
+-- Depende de: auth_clinic_id() (bloco 5) → profiles (bloco 4). OK.
+create policy "patients_select_same_clinic"
+  on public.patients
+  for select
+  to authenticated
+  using (clinic_id = public.auth_clinic_id());
+
+-- INSERT: deve inserir no próprio tenant.
+-- Depende de: auth_clinic_id() (bloco 5) → profiles (bloco 4). OK.
+create policy "patients_insert_same_clinic"
+  on public.patients
+  for insert
+  to authenticated
+  with check (clinic_id = public.auth_clinic_id());
+
+-- UPDATE: só dentro do próprio tenant.
+-- Depende de: auth_clinic_id() (bloco 5) → profiles (bloco 4). OK.
+create policy "patients_update_same_clinic"
+  on public.patients
+  for update
+  to authenticated
+  using (clinic_id = public.auth_clinic_id())
+  with check (clinic_id = public.auth_clinic_id());
+
+-- DELETE (hard): não permitido por RLS — soft delete via UPDATE deleted_at.
+-- Purga física controlada pelo service role (processo DPO).
+create policy "patients_no_hard_delete"
+  on public.patients
+  for delete
+  using (false);
+
+-- ---------------------------------------------------------------------------
+-- Policies: appointments
+-- ---------------------------------------------------------------------------
+
 -- SELECT: apenas agendamentos do próprio tenant.
+-- Depende de: auth_clinic_id() (bloco 5) → profiles (bloco 4). OK.
 create policy "appointments_select_same_clinic"
   on public.appointments
   for select
@@ -709,6 +763,7 @@ create policy "appointments_select_same_clinic"
 -- INSERT: deve pertencer ao próprio tenant.
 -- Coerência de patient_id/professional_id garantida pelas FKs compostas (A1)
 -- e pelo trigger check_professional_role (A2).
+-- Depende de: auth_clinic_id() (bloco 5) → profiles (bloco 4). OK.
 create policy "appointments_insert_same_clinic"
   on public.appointments
   for insert
@@ -716,6 +771,7 @@ create policy "appointments_insert_same_clinic"
   with check (clinic_id = public.auth_clinic_id());
 
 -- UPDATE: apenas dentro do próprio tenant.
+-- Depende de: auth_clinic_id() (bloco 5) → profiles (bloco 4). OK.
 create policy "appointments_update_same_clinic"
   on public.appointments
   for update
@@ -731,6 +787,7 @@ create policy "appointments_update_same_clinic"
 -- financeiro. Restringimos ao papel admin via is_clinic_admin(). Usuários
 -- não-admin devem usar UPDATE status='cancelado' (soft cancel).
 -- is_clinic_admin() é SECURITY DEFINER — não pode ser bypassada.
+-- Depende de: auth_clinic_id() e is_clinic_admin() (bloco 5) → profiles (bloco 4). OK.
 create policy "appointments_delete_admin_only"
   on public.appointments
   for delete
@@ -741,17 +798,43 @@ create policy "appointments_delete_admin_only"
   );
 
 -- =============================================================================
+-- BLOCO 8: Triggers
+-- =============================================================================
+-- Todos os triggers são criados após as tabelas (bloco 4) e as funções
+-- que eles chamam (blocos 3 e 5).
+
+-- Trigger de updated_at em clinics
+-- Depende de: set_updated_at() (bloco 3) e tabela clinics (bloco 4). OK.
+create or replace trigger clinics_set_updated_at
+  before update on public.clinics
+  for each row execute function public.set_updated_at();
+
+-- Trigger de updated_at em patients
+-- Depende de: set_updated_at() (bloco 3) e tabela patients (bloco 4). OK.
+create or replace trigger patients_set_updated_at
+  before update on public.patients
+  for each row execute function public.set_updated_at();
+
+-- Trigger A2: verificar role do professional_id em appointments
+-- Depende de: check_professional_role() (bloco 5) e tabela appointments (bloco 4). OK.
+create or replace trigger appointments_check_professional
+  before insert or update of professional_id on public.appointments
+  for each row execute function public.check_professional_role();
+
+-- =============================================================================
 -- DOWN (reversão — executar em ordem inversa)
 -- =============================================================================
 -- Para reverter esta migration:
+--
+-- drop trigger  if exists appointments_check_professional      on public.appointments;
+-- drop trigger  if exists patients_set_updated_at              on public.patients;
+-- drop trigger  if exists clinics_set_updated_at               on public.clinics;
 --
 -- drop policy if exists "appointments_delete_admin_only"      on public.appointments;
 -- drop policy if exists "appointments_update_same_clinic"     on public.appointments;
 -- drop policy if exists "appointments_insert_same_clinic"     on public.appointments;
 -- drop policy if exists "appointments_select_same_clinic"     on public.appointments;
 -- revoke select, insert, update, delete on public.appointments from authenticated;
--- drop trigger  if exists appointments_check_professional      on public.appointments;
--- drop function if exists public.check_professional_role();
 -- drop table    if exists public.appointments;
 --
 -- drop policy if exists "patients_no_hard_delete"             on public.patients;
@@ -773,6 +856,7 @@ create policy "appointments_delete_admin_only"
 -- revoke select on public.clinics from authenticated;
 -- drop table  if exists public.clinics;
 --
+-- drop function if exists public.check_professional_role();
 -- drop function if exists public.update_member_role(uuid, public.user_role);
 -- drop function if exists public.is_clinic_admin();
 -- drop function if exists public.auth_clinic_id();
