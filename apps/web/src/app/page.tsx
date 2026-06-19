@@ -1,20 +1,10 @@
-import { colors } from "@harmoni/ui/tokens";
-import { ROLES } from "@harmoni/core";
+/**
+ * Rota: / (raiz)
+ * Ponto de entrada do app. Redireciona para o dashboard; o middleware
+ * encaminha para /login quando não há sessão ativa.
+ */
+import { redirect } from "next/navigation";
 
-export default function HomePage() {
-  return (
-    <main className="min-h-screen bg-surface p-8">
-      <div className="mx-auto max-w-2xl">
-        <h1 className="text-3xl font-bold" style={{ color: colors.primary }}>
-          Harmoni Care
-        </h1>
-        <p className="mt-2 text-slate-600">
-          Monorepo de fundação no ar. Web + packages compartilhados conectados.
-        </p>
-        <p className="mt-4 text-sm text-slate-500">
-          Papéis carregados de @harmoni/core: {ROLES.join(", ")}
-        </p>
-      </div>
-    </main>
-  );
+export default function RootPage() {
+  redirect("/dashboard");
 }

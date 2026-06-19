@@ -3,5 +3,6 @@
  * Compartilhado entre web e mobile. Sem dependência de UI ou de I/O.
  */
 export * from "./roles";
+export * from "./schemas/auth";
 export * from "./schemas/patient";
 export * from "./schemas/appointment";
